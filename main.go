@@ -3,6 +3,7 @@ package main
 import (
 	"encoding/json"
 	"fmt"
+	"io"
 	"log"
 	"net/http"
 	"reflect"
@@ -10,6 +11,10 @@ import (
 
 	"github.com/google/uuid"
 	elastic "gopkg.in/olivere/elastic.v3"
+
+	"context"
+
+	"cloud.google.com/go/storage"
 )
 
 type Location struct {
@@ -22,13 +27,15 @@ type Post struct {
 	User     string   `json:"user"`
 	Message  string   `json:"message"`
 	Location Location `json:"location"`
+	Url      string   `json:"url"`
 }
 
 const (
-	INDEX    = "around"
-	TYPE     = "post"
-	DISTANCE = "200km"
-	ES_URL   = "http://35.184.94.39:9200/"
+	INDEX       = "around"
+	TYPE        = "post"
+	DISTANCE    = "200km"
+	ES_URL      = "http://35.223.191.44:9200"
+	BUCKET_NAME = "post-images-263423"
 )
 
 func main() {
@@ -78,23 +85,124 @@ func main() {
 func handlerPost(w http.ResponseWriter, r *http.Request) { // * is pointer, means it is not a copy of the
 	// object; Similar to python, in go, all input are like primitive pytes in Java, it is a copy of the original object.
 	// Parse from body of request to get a json object.
-	fmt.Println("Received one post request")
-	decoder := json.NewDecoder(r.Body)
-	var p Post
-	if err := decoder.Decode(&p); err != nil { // &传地址
-		panic(err)
-		return
-	}
 
-	fmt.Fprintf(w, "Post received: %s\n", p.Message) // save the message to the w object
+	//USE FOR JSON DATA
+	// fmt.Println("Received one post request")
+	// decoder := json.NewDecoder(r.Body)
+	// var p Post
+	// if err := decoder.Decode(&p); err != nil { // &传地址
+	// 	panic(err)
+	// 	return
+	// }
+
+	// fmt.Fprintf(w, "Post received: %s\n", p.Message) // save the message to the w object
+
+	// // generate an unique id for each post
+	// id := uuid.New().String()
+	// fmt.Println(reflect.TypeOf(id))
+	// fmt.Println(reflect.TypeOf(123))
+	// // Save to ES.
+	// saveToES(&p, id)
+
+	w.Header().Set("Content-Type", "application/json")
+	w.Header().Set("Access-Control-Allow-Origin", "*")
+	w.Header().Set("Access-Control-Allow-Headers", "Content-Type,Authorization")
+
+	// PARSE FORM DATA
+	// 32 << 20 is the maxMemory param for ParseMultipartForm, equals to 32MB (1MB = 1024 * 1024 bytes = 2^20 bytes)
+	// After you call ParseMultipartForm, the file will be saved in the server memory with maxMemory size.
+	// If the file size is larger than maxMemory, the rest of the data will be saved in a system temporary file.
+	r.ParseMultipartForm(32 << 20)
+
+	// Parse from form data.
+	// Parse string text/
+	fmt.Printf("Received one post request %s\n", r.FormValue("message"))
+	lat, _ := strconv.ParseFloat(r.FormValue("lat"), 64)
+	lon, _ := strconv.ParseFloat(r.FormValue("lon"), 64)
+	p := &Post{
+		User:    "1111",
+		Message: r.FormValue("message"),
+		Location: Location{
+			Lat: lat,
+			Lon: lon,
+		},
+	}
 
 	// generate an unique id for each post
 	id := uuid.New().String()
-	fmt.Println(reflect.TypeOf(id))
-	fmt.Println(reflect.TypeOf(123))
-	// Save to ES.
-	saveToES(&p, id)
 
+	// parse image in the form
+	file, _, err := r.FormFile("image")
+	if err != nil {
+		http.Error(w, "Image is not available", http.StatusInternalServerError)
+		fmt.Printf("Image is not available %v.\n", err)
+		return
+	}
+	defer file.Close()
+
+	// GCS's credential (password to connect GCS)
+	ctx := context.Background()
+
+	// replace it with your real bucket name.
+	_, attrs, err := saveToGCS(ctx, file, BUCKET_NAME, id)
+	if err != nil {
+		http.Error(w, "GCS is not setup", http.StatusInternalServerError)
+		fmt.Printf("GCS is not setup %v\n", err)
+		return
+	}
+
+	// Update the media link after saving to GCS.
+	p.Url = attrs.MediaLink
+
+	// Save to ES.
+	saveToES(p, id)
+
+	// Save to BigTable.
+	//saveToBigTable(p, id)
+
+}
+
+// Save a post to GCS
+func saveToGCS(ctx context.Context, r io.Reader, bucketName, name string) (*storage.ObjectHandle, *storage.ObjectAttrs, error) {
+	// connect to the GCS client
+	client, err := storage.NewClient(ctx)
+	if err != nil {
+		return nil, nil, err
+	}
+	defer client.Close()
+
+	// Sets the name for the new bucket, we have created on console, so we just use the name we used in console
+	// bucketName := "post-images-263423"
+
+	// use the bucket we have created
+	bucket := client.Bucket(bucketName)
+
+	// Next check if the bucket exists
+	if _, err = bucket.Attrs(ctx); err != nil {
+		return nil, nil, err
+	}
+
+	// create the object in the bucket
+	obj := bucket.Object(name)
+	// create the object's writer
+	w := obj.NewWriter(ctx)
+	// io.copy write the content into the obj
+	if _, err := io.Copy(w, r); err != nil {
+		return nil, nil, err
+	}
+	if err := w.Close(); err != nil {
+		return nil, nil, err
+	}
+
+	// change the authoritation, so that every one could read the file, but only admin could modify
+	if err := obj.ACL().Set(ctx, storage.AllUsers, storage.RoleReader); err != nil {
+		return nil, nil, err
+	}
+
+	// get the url links, attrs.MediaLink
+	attrs, err := obj.Attrs(ctx)
+	fmt.Printf("Post is saved to GCS: %s\n", attrs.MediaLink)
+	return obj, attrs, err
 }
 
 // Save a post to ElasticSearch
