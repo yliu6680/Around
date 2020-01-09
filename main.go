@@ -15,6 +15,10 @@ import (
 	"context"
 
 	"cloud.google.com/go/storage"
+	jwtmiddleware "github.com/auth0/go-jwt-middleware"
+
+	"github.com/dgrijalva/jwt-go"
+	"github.com/gorilla/mux"
 )
 
 type Location struct {
@@ -22,6 +26,7 @@ type Location struct {
 	Lon float64 `json:"lon"`
 }
 
+// POST object for storing post request
 type Post struct {
 	// `json:"user"` is for the json parsing of this User field. Otherwise, by default it's 'User'.
 	User     string   `json:"user"`
@@ -30,13 +35,16 @@ type Post struct {
 	Url      string   `json:"url"`
 }
 
+// constant used in the environment, ES_URL for the elastic search GCE's ip
 const (
 	INDEX       = "around"
 	TYPE        = "post"
 	DISTANCE    = "200km"
-	ES_URL      = "http://35.223.7.9:9200"
+	ES_URL      = "http://104.197.125.211:9200/"
 	BUCKET_NAME = "post-images-263423"
 )
+
+var mySigningKey = []byte("yuanrongdesecret")
 
 func main() {
 	// Create a client
@@ -75,11 +83,32 @@ func main() {
 	}
 
 	fmt.Println("started-service")
+
+	r := mux.NewRouter()
+
+	// new jwtMiddleware，用于handle 用户的 token
+	var jwtMiddleware = jwtmiddleware.New(jwtmiddleware.Options{
+		// get the secret key, error 是一个类型
+		ValidationKeyGetter: func(token *jwt.Token) (interface{}, error) {
+			return mySigningKey, nil
+		},
+		SigningMethod: jwt.SigningMethodHS256,
+	})
+
 	// 两个handler是一直存在的，并且并发的，当http在8080监听到request时，再调用不同的handler
-	http.HandleFunc("/post", handlerPost)
-	http.HandleFunc("/search", handlerSearch)
-	// listenAndServe run the server on 8080 port, the nil is the handler, we have defined before
+	// http.HandleFunc("/post", handlerPost)
+	// 之前直接递交给http的handler，现在用mux的router包装一层，传递到jwtmiddleware，middleware可以判断用户的token是否valid
+	r.Handle("/post", jwtMiddleware.Handler(http.HandlerFunc(handlerPost))).Methods("POST")
+	r.Handle("/search", jwtMiddleware.Handler(http.HandlerFunc(handlerSearch))).Methods("GET")
+	r.Handle("/login", http.HandlerFunc(loginHandler)).Methods("POST")
+	r.Handle("/signup", http.HandlerFunc(signupHandler)).Methods("POST")
+
+	http.Handle("/", r)
 	log.Fatal(http.ListenAndServe(":8080", nil))
+
+	// http.HandleFunc("/search", handlerSearch)
+	// listenAndServe run the server on 8080 port, the nil is the handler, we have defined before
+	// log.Fatal(http.ListenAndServe(":8080", nil))
 }
 
 func handlerPost(w http.ResponseWriter, r *http.Request) { // * is pointer, means it is not a copy of the
@@ -104,9 +133,17 @@ func handlerPost(w http.ResponseWriter, r *http.Request) { // * is pointer, mean
 	// // Save to ES.
 	// saveToES(&p, id)
 
+	// w is the response, so all these set are setting for the response to users
+	// * means all address could use the the response
 	w.Header().Set("Content-Type", "application/json")
 	w.Header().Set("Access-Control-Allow-Origin", "*")
 	w.Header().Set("Access-Control-Allow-Headers", "Content-Type,Authorization")
+
+	user := r.Context().Value("user")
+	// transfer to claims, to get the data we need (save in the playload in jwt tutorial)
+	claims := user.(*jwt.Token).Claims
+	// get the user name
+	username := claims.(jwt.MapClaims)["username"]
 
 	// PARSE FORM DATA
 	// 32 << 20 is the maxMemory param for ParseMultipartForm, equals to 32MB (1MB = 1024 * 1024 bytes = 2^20 bytes)
@@ -120,7 +157,7 @@ func handlerPost(w http.ResponseWriter, r *http.Request) { // * is pointer, mean
 	lat, _ := strconv.ParseFloat(r.FormValue("lat"), 64)
 	lon, _ := strconv.ParseFloat(r.FormValue("lon"), 64)
 	p := &Post{
-		User:    "1111",
+		User:    username.(string),
 		Message: r.FormValue("message"),
 		Location: Location{
 			Lat: lat,
@@ -151,10 +188,10 @@ func handlerPost(w http.ResponseWriter, r *http.Request) { // * is pointer, mean
 		return
 	}
 
-	// Update the media link after saving to GCS.
+	// Update the media link into the post request
 	p.Url = attrs.MediaLink
 
-	// Save to ES.
+	// Save the post request to ES engine.
 	saveToES(p, id)
 
 	// Save to BigTable.
